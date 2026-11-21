@@ -1,60 +1,33 @@
 import time
-import chromadb
-from pypdf import PdfReader
-from google import genai
+
 from dotenv import load_dotenv
+from google import genai
+
+from retrieval import Retriever, build_index
 
 load_dotenv()                         # reads GEMINI_API_KEY from .env
-
-FILES = ["Hochbaum-OR.pdf", "IoT.pdf", "Quality Assurance.pdf"]
-CHUNK_SIZE, OVERLAP = 800, 150
 MODEL = "gemini-3.8-flash"
+MODE = "hybrid+rerank"                # or "hybrid" / "vector"
 
-# 1. LOAD
-def load_pdf(path):
-    reader = PdfReader(path)
-    return [(page.extract_text() or "", i + 1) for i, page in enumerate(reader.pages)]
-
-# 2. CHUNK
-def chunk(text, size=CHUNK_SIZE, overlap=OVERLAP):
-    pieces, start = [], 0
-    while start < len(text):
-        pieces.append(text[start:start + size])
-        start += size - overlap
-    return pieces
-
-# 3 + 4. EMBED and STORE (Chroma embeds with its built-in model)
-db = chromadb.PersistentClient(path="rag_db")
-col = db.get_or_create_collection("docs")
-
-if col.count() == 0:                  # index only the first time
-    for f in FILES:
-        ids, docs, metas = [], [], []
-        for text, page in load_pdf(f):
-            for j, piece in enumerate(chunk(text)):
-                ids.append(f"{f}-p{page}-c{j}")
-                docs.append(piece)
-                metas.append({"source": f, "page": page})
-        for i in range(0, len(ids), 200):      # store in batches of 200
-            col.upsert(ids=ids[i:i+200], documents=docs[i:i+200], metadatas=metas[i:i+200])
-        print(f"Indexed {f}: {len(ids)} chunks")
+col = build_index()
 print("Stored chunks:", col.count())
-
-client = genai.Client()               # uses GEMINI_API_KEY loaded from .env
+retriever = Retriever(col)
+client = genai.Client()
 
 while True:
     question = input("\nAsk (or 'quit'): ")
     if question == "quit":
         break
 
-    # 5. RETRIEVE
-    res = col.query(query_texts=[question], n_results=4)
-    print("\n--- Retrieved pieces (lower distance = closer) ---")
-    for d, m, dist in zip(res["documents"][0], res["metadatas"][0], res["distances"][0]):
-        print(f"[{m['source']} p{m['page']}] distance={dist:.3f}  {d[:120]}...")
+    # 5. RETRIEVE: vector + BM25, fused with RRF, then reranked
+    ids = retriever.search(question, mode=MODE)
+    print(f"\n--- Retrieved pieces ({MODE}) ---")
+    for i in ids:
+        m = retriever.meta[i]
+        print(f"[{m['source']} p{m['page']}]  {retriever.text[i][:120]}...")
 
-    context = "\n\n".join(f"[{m['source']} p{m['page']}] {d}"
-                          for d, m in zip(res["documents"][0], res["metadatas"][0]))
+    context = "\n\n".join(
+        f"[{retriever.meta[i]['source']} p{retriever.meta[i]['page']}] {retriever.text[i]}" for i in ids)
 
     # 6. GENERATE (retry with increasing waits if the model is busy)
     prompt = f"""Answer using only the context below. Cite sources like [file p#].
